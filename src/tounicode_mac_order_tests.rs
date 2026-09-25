@@ -11,7 +11,7 @@ fn cmapless_truetype(glyphs: &[(bool, u16)]) -> Vec<u8> {
 
 /// The same font, optionally with a (3,1) `cmap` mapping `A` to glyph 36,
 /// or a `post` format 2 table naming glyph 36 `A`.
-fn truetype(glyphs: &[(bool, u16)], with_cmap: bool, with_post_names: bool) -> Vec<u8> {
+pub(crate) fn truetype(glyphs: &[(bool, u16)], with_cmap: bool, with_post_names: bool) -> Vec<u8> {
     let square: Vec<u8> = {
         let mut g = Vec::new();
         g.extend(1i16.to_be_bytes());

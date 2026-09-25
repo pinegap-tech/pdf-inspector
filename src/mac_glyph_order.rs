@@ -392,4 +392,4 @@ pub(crate) fn build_cmap_from_mac_glyph_order(font_data: &[u8]) -> Option<ToUnic
 
 #[cfg(test)]
 #[path = "tounicode_mac_order_tests.rs"]
-mod tests;
+pub(crate) mod tests;

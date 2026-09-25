@@ -628,10 +628,11 @@ fn font_cmap_entry(
     obj_num: u32,
     build: EntryBuild,
 ) -> CMapEntry {
-    let (mut primary, mut remapped) = try_remap_subset_cmap(cmap, font_dict, doc, obj_num);
+    let program = LazyProgram::new(font_dict, doc);
+    let (mut primary, mut remapped) =
+        try_remap_subset_cmap(cmap, font_dict, doc, obj_num, &program);
     let primary_entries = primary.char_map.len() + primary.ranges.len();
     let sparse = primary_entries < 10;
-    let program = LazyProgram::new(font_dict, doc);
     let encoding_fallback = build_fallback_tounicode_from_encoding(font_dict, doc);
     let program_fallback = match build.program_fallback {
         ProgramFallback::Always => true,
@@ -1522,6 +1523,17 @@ impl ToUnicodeCMap {
         }
     }
 
+    /// The source codes of all mappings (char_map + ranges), at most 2^17
+    /// range members visited.
+    fn source_codes(&self) -> HashSet<u16> {
+        self.char_map
+            .keys()
+            .copied()
+            .chain(self.ranges.iter().flat_map(|&(start, end, _)| start..=end))
+            .take(1 << 17)
+            .collect()
+    }
+
     /// Get the maximum source CID across all mappings (char_map + ranges).
     fn max_source_cid(&self) -> Option<u16> {
         let char_max = self.char_map.keys().copied().max();
@@ -1884,13 +1896,7 @@ fn parse_cid_to_gid_stream(data: &[u8]) -> Option<Vec<u16>> {
 /// glyph for than are glyph indices it draws: then the CMap is keyed by CID.
 fn cmap_is_keyed_by_cid(cmap: &ToUnicodeCMap, cid_to_gid: &[u16]) -> bool {
     let gids: HashSet<u16> = cid_to_gid.iter().copied().filter(|&gid| gid != 0).collect();
-    let codes: HashSet<u16> = cmap
-        .char_map
-        .keys()
-        .copied()
-        .chain(cmap.ranges.iter().flat_map(|&(start, end, _)| start..=end))
-        .take(1 << 17)
-        .collect();
+    let codes = cmap.source_codes();
     let as_cid = codes
         .iter()
         .filter(|&&code| {
@@ -1901,6 +1907,19 @@ fn cmap_is_keyed_by_cid(cmap: &ToUnicodeCMap, cid_to_gid: &[u16]) -> bool {
         .count();
     let as_gid = codes.iter().filter(|code| gids.contains(code)).count();
     as_cid > as_gid
+}
+
+/// Whether the font program's own reading gives most of the CMap's codes
+/// the CMap's text: then the CMap is keyed by the program's glyph indices.
+fn cmap_agrees_with_program(cmap: &ToUnicodeCMap, program: &ToUnicodeCMap) -> bool {
+    let (mut read, mut agreed) = (0usize, 0usize);
+    for code in cmap.source_codes() {
+        if let Some(text) = program.lookup(code) {
+            read += 1;
+            agreed += usize::from(cmap.lookup(code).as_deref() == Some(text.as_str()));
+        }
+    }
+    agreed * 2 > read
 }
 
 /// Build a CID→Unicode CMap by applying a CIDToGIDMap to an existing CMap that maps GID→Unicode.
@@ -1935,6 +1954,7 @@ fn try_remap_subset_cmap(
     font_dict: &lopdf::Dictionary,
     doc: &Document,
     obj_num: u32,
+    program: &LazyProgram<'_>,
 ) -> (ToUnicodeCMap, Option<ToUnicodeCMap>) {
     // Only applies to Identity-H/V CID fonts
     let encoding = font_dict
@@ -2017,19 +2037,17 @@ fn try_remap_subset_cmap(
         }
     }
 
-    // CIDs are glyph indices here. A program with a glyph for every code the
-    // CMap maps was not renumbered (LibreOffice keeps a subset's original
-    // glyph indices), and remapping it would read each code as another.
-    if let Some(max_cid) = cmap.max_source_cid() {
-        let glyphs = font_program(cid_font_dict, doc).and_then(|data| {
-            ttf_parser::Face::parse(&data, 0)
-                .ok()
-                .map(|face| face.number_of_glyphs())
-        });
-        if glyphs.is_some_and(|glyphs| glyphs > max_cid) {
-            debug!("Subset remap skipped for obj={obj_num}: the program has a glyph for CMap max CID {max_cid}");
-            return (cmap, None);
-        }
+    // CIDs are glyph indices here. Where the program's own cmap reads the
+    // CMap's codes as the CMap does, the CMap is keyed by this program's
+    // glyphs (LibreOffice keeps a subset's original glyph indices), not by
+    // glyphs a subsetter renumbered, and remapping it would read each code
+    // as another.
+    if program
+        .reading()
+        .is_some_and(|reading| cmap_agrees_with_program(&cmap, reading))
+    {
+        debug!("Subset remap skipped for obj={obj_num}: the font program reads the CMap's codes as it does");
+        return (cmap, None);
     }
 
     debug!(
@@ -5064,7 +5082,13 @@ endbfrange
             lopdf::Object::Array(vec![lopdf::Object::Reference(cid_font_id)]),
         );
 
-        let (primary, remapped) = try_remap_subset_cmap(cmap, &font_dict, &doc, 123);
+        let (primary, remapped) = try_remap_subset_cmap(
+            cmap,
+            &font_dict,
+            &doc,
+            123,
+            &LazyProgram::new(&font_dict, &doc),
+        );
         assert!(
             remapped.is_none(),
             "Remap must be skipped when W covers CMap max CID (this is 16.pdf)"
@@ -5104,7 +5128,13 @@ endbfrange
             lopdf::Object::Array(vec![lopdf::Object::Reference(cid_font_id)]),
         );
 
-        let (_primary, remapped) = try_remap_subset_cmap(cmap, &font_dict, &doc, 456);
+        let (_primary, remapped) = try_remap_subset_cmap(
+            cmap,
+            &font_dict,
+            &doc,
+            456,
+            &LazyProgram::new(&font_dict, &doc),
+        );
         assert!(
             remapped.is_some(),
             "Remap must fire when CMap's CIDs are outside W array coverage"
@@ -5159,7 +5189,13 @@ endbfrange
             lopdf::Object::Array(vec![lopdf::Object::Reference(cid_font_id)]),
         );
 
-        let (primary, remapped) = try_remap_subset_cmap(cmap, &font_dict, &doc, 789);
+        let (primary, remapped) = try_remap_subset_cmap(
+            cmap,
+            &font_dict,
+            &doc,
+            789,
+            &LazyProgram::new(&font_dict, &doc),
+        );
         assert!(
             remapped.is_none(),
             "Remap must be skipped for CIDFontType0 (CFF) descendants, including a \
@@ -5167,6 +5203,61 @@ endbfrange
         );
         // The original CMap must still resolve its own CIDs.
         assert_eq!(primary.lookup(0x0200), Some("\u{0410}".to_string()));
+    }
+
+    #[test]
+    fn test_subset_remap_skips_a_cmap_the_program_reads_alike() {
+        // LibreOffice keeps a subset's glyph indices: glyph 36 is "A" in the
+        // program's cmap and in the ToUnicode CMap, and the sparse W array misses
+        // it. A CMap that reads the glyph otherwise was written for other glyphs.
+        let mut doc = Document::new();
+        let program = crate::mac_glyph_order::tests::truetype(&[(true, 500); 40], true, false);
+        let font_file = doc.add_object(lopdf::Stream::new(lopdf::Dictionary::new(), program));
+        let mut descriptor = lopdf::Dictionary::new();
+        descriptor.set("FontFile2", lopdf::Object::Reference(font_file));
+        let descriptor_id = doc.add_object(descriptor);
+        let mut cid_font = lopdf::Dictionary::new();
+        cid_font.set("Subtype", lopdf::Object::Name(b"CIDFontType2".to_vec()));
+        cid_font.set("FontDescriptor", lopdf::Object::Reference(descriptor_id));
+        cid_font.set(
+            "W",
+            lopdf::Object::Array(vec![
+                lopdf::Object::Integer(0),
+                lopdf::Object::Array(vec![lopdf::Object::Integer(500)]),
+            ]),
+        );
+        let cid_font_id = doc.add_object(cid_font);
+        let mut font_dict = lopdf::Dictionary::new();
+        font_dict.set("Subtype", lopdf::Object::Name(b"Type0".to_vec()));
+        font_dict.set("Encoding", lopdf::Object::Name(b"Identity-H".to_vec()));
+        font_dict.set(
+            "DescendantFonts",
+            lopdf::Object::Array(vec![lopdf::Object::Reference(cid_font_id)]),
+        );
+        let remap_of = |destination: &str| {
+            let content = format!(
+                "1 begincodespacerange\n<0000><FFFF>\nendcodespacerange\n\
+                 1 beginbfchar\n<0024> <{destination}>\nendbfchar\n"
+            );
+            let cmap = ToUnicodeCMap::parse(content.as_bytes()).unwrap();
+            try_remap_subset_cmap(
+                cmap,
+                &font_dict,
+                &doc,
+                1,
+                &LazyProgram::new(&font_dict, &doc),
+            )
+            .1
+        };
+
+        assert!(
+            remap_of("0041").is_none(),
+            "the program reads glyph 36 as the CMap does"
+        );
+        assert!(
+            remap_of("0042").is_some(),
+            "a CMap the program contradicts is still remapped"
+        );
     }
 
     #[test]
@@ -5203,7 +5294,13 @@ endbfrange
             lopdf::Object::Array(vec![lopdf::Object::Reference(cid_font_id)]),
         );
 
-        let (primary, remapped) = try_remap_subset_cmap(cmap, &font_dict, &doc, 205);
+        let (primary, remapped) = try_remap_subset_cmap(
+            cmap,
+            &font_dict,
+            &doc,
+            205,
+            &LazyProgram::new(&font_dict, &doc),
+        );
         assert!(
             remapped.is_none(),
             "a CMap keyed by CID must not be read by GID"
@@ -5248,7 +5345,13 @@ endbfrange
             lopdf::Object::Array(vec![lopdf::Object::Reference(cid_font_id)]),
         );
 
-        let (_primary, remapped) = try_remap_subset_cmap(cmap, &font_dict, &doc, 790);
+        let (_primary, remapped) = try_remap_subset_cmap(
+            cmap,
+            &font_dict,
+            &doc,
+            790,
+            &LazyProgram::new(&font_dict, &doc),
+        );
         assert!(
             remapped.is_some(),
             "An indirect /Subtype naming CIDFontType2 must still reach the remap"
